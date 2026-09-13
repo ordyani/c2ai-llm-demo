@@ -50,16 +50,31 @@ def serve_health(port: int) -> None:
     ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-def chat_once(endpoint: str, token: str, model: str, prompt: str) -> dict:
+def build_chat_url(endpoint: str) -> str:
+    """Athena injects LLM_ENDPOINT as host:port (no scheme, no path).
+
+    Normalize it into a full chat/completions URL. Override the path with
+    LLM_PATH if your gateway uses a different route.
+    """
+    ep = endpoint.strip()
+    if not ep.startswith(("http://", "https://")):
+        ep = "http://" + ep  # in-cluster gateway is plain HTTP
+    path = os.environ.get("LLM_PATH", "/v1/chat/completions")
+    if "/v1/" in ep or ep.rstrip("/").endswith(path.rstrip("/")):
+        return ep  # caller already gave a full URL
+    return ep.rstrip("/") + path
+
+
+def chat_once(url: str, token: str, model: str, prompt: str) -> dict:
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 128,
     }).encode()
-    request = urllib.request.Request(
-        endpoint, data=body, method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:  # internal gateway may need no token; only send one if provided
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, data=body, method="POST", headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode())
 
@@ -76,14 +91,17 @@ def main() -> None:
     threading.Thread(target=serve_health, args=(port,), daemon=True).start()
     print(f"health server on :{port}; model={model} batch_size={batch_size} interval={batch_interval}s")
 
-    if not endpoint or not token:
-        print("WARNING: LLM_ENDPOINT / LLM_API_TOKEN not set — serving health only, no gateway calls")
+    if not endpoint:
+        print("WARNING: LLM_ENDPOINT not set — serving health only, no gateway calls")
+    else:
+        url = build_chat_url(endpoint)
+        print(f"gateway url: {url} (token {'set' if token else 'not set'})")
 
     while True:
-        if endpoint and token:
+        if endpoint:
             for _ in range(batch_size):
                 try:
-                    result = chat_once(endpoint, token, model, prompt)
+                    result = chat_once(url, token, model, prompt)
                     usage = result.get("usage", {}) or {}
                     STATE["ok"] += 1
                     print(f"ok: prompt_tokens={usage.get('prompt_tokens')} "
